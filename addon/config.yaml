@@ -1,8 +1,8 @@
 name: Platewatch ANPR
-version: "1.0.0"
+version: "1.0.1"
 slug: platewatch
 description: ANPR camera event storage and analytics dashboard
-url: https://github.com/your-account/platewatch
+url: https://github.com/synthtex/platewatch-anpr
 arch:
   - amd64
   - aarch64
