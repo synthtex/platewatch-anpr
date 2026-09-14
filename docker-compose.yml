@@ -1,0 +1,15 @@
+services:
+  platewatch:
+    build: .
+    container_name: platewatch
+    restart: unless-stopped
+    ports:
+      - "8022:8022"
+    volumes:
+      - platewatch-data:/app/data
+    environment:
+      ANPR_DB: /app/data/anpr.sqlite3
+      PORT: 8022
+
+volumes:
+  platewatch-data:

@@ -1,0 +1,24 @@
+name: Platewatch ANPR
+version: "1.0.0"
+slug: platewatch
+description: ANPR camera event storage and analytics dashboard
+url: https://github.com/your-account/platewatch
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+init: false
+ingress: true
+ingress_port: 8022
+panel_icon: mdi:car-search
+panel_title: Platewatch
+ports:
+  8022/tcp: null
+ports_description:
+  8022/tcp: ANPR dashboard and camera ingest API
+map:
+  - data:rw
+options: {}
+schema: {}
