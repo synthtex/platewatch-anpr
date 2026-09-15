@@ -100,8 +100,17 @@ class Handler(BaseHTTPRequestHandler):
             conn = db(); rows = conn.execute("SELECT * FROM cameras ORDER BY name").fetchall(); conn.close()
             return self._send(200, {"cameras": [dict(r) for r in rows]})
         if parsed.path == "/api/events":
-            q = parse_qs(parsed.query); limit = min(int(q.get("limit", [50])[0]), 500)
-            conn = db(); rows = conn.execute("SELECT id,plate,confidence,camera,direction,vehicle_type,vehicle_color,captured_at,image_url,created_at,thumbnail IS NOT NULL AS has_thumbnail,vehicle_image IS NOT NULL AS has_vehicle_image FROM events ORDER BY captured_at DESC LIMIT ?", (limit,)).fetchall(); conn.close()
+            q = parse_qs(parsed.query)
+            try: limit = min(max(int(q.get("limit", [50])[0]), 1), 500)
+            except ValueError: return self._send(400, {"error": "limit must be between 1 and 500"})
+            plate_query = q.get("plate", [""])[0].strip().upper()
+            if len(plate_query) > 64: return self._send(400, {"error": "plate search is too long"})
+            sql = "SELECT id,plate,confidence,camera,direction,vehicle_type,vehicle_color,captured_at,image_url,created_at,thumbnail IS NOT NULL AS has_thumbnail,vehicle_image IS NOT NULL AS has_vehicle_image FROM events"
+            parameters = []
+            if plate_query:
+                sql += " WHERE plate LIKE ?"; parameters.append(f"%{plate_query}%")
+            sql += " ORDER BY captured_at DESC LIMIT ?"; parameters.append(limit)
+            conn = db(); rows = conn.execute(sql, parameters).fetchall(); conn.close()
             return self._send(200, {"events": [dict(r) for r in rows]})
         if parsed.path.startswith("/api/events/"):
             parts = parsed.path.strip("/").split("/")

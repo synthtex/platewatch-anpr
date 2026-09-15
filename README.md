@@ -8,7 +8,9 @@ Send detections to `POST /api/events` as JSON:
 {"plate":"ABC123","confidence":0.96,"camera":"Gate A","direction":"in","vehicle_type":"car","captured_at":"2026-09-14T10:30:00Z"}
 ```
 
-The SQLite database is created as `anpr.sqlite3` (override with `ANPR_DB`). The API also accepts `license_plate`, `number_plate`, `camera_id`, `timestamp`, and `snapshot_url` aliases.
+The SQLite database is created as `anpr.sqlite3` (override with `ANPR_DB`). Camera events use the nested `Picture.Plate`, `Picture.SnapInfo`, and `Picture.Vehicle` payload fields.
+
+Use `GET /api/events?plate=ABC&limit=100` to search all stored events by a partial plate number and choose up to 500 returned events.
 
 ## Docker
 
