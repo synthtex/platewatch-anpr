@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import base64
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,8 +29,9 @@ def db():
         created_at TEXT NOT NULL
     )""")
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
-    if "vehicle_color" not in columns:
-        conn.execute("ALTER TABLE events ADD COLUMN vehicle_color TEXT")
+    for name, definition in (("vehicle_color", "TEXT"), ("thumbnail", "BLOB"), ("vehicle_image", "BLOB")):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {name} {definition}")
     return conn
 
 
@@ -40,6 +42,8 @@ def normalise(payload):
     plate_info = picture.get("Plate") if isinstance(picture.get("Plate"), dict) else {}
     snap_info = picture.get("SnapInfo") if isinstance(picture.get("SnapInfo"), dict) else {}
     vehicle_info = picture.get("Vehicle") if isinstance(picture.get("Vehicle"), dict) else {}
+    thumbnail = image_bytes(picture.get("CutoutPic"), "Picture.CutoutPic", 256 * 1024)
+    vehicle_image = image_bytes(picture.get("VehiclePic"), "Picture.VehiclePic", 2 * 1024 * 1024)
     plate = plate_info.get("PlateNumber")
     if not plate or not isinstance(plate, str):
         raise ValueError("plate is required")
@@ -62,8 +66,24 @@ def normalise(payload):
         "direction": str(snap_info.get("Direction") or "Unknown"),
         "vehicle_type": "Unknown",
         "vehicle_color": str(vehicle_info.get("VehicleColor") or "Unknown"),
+        "thumbnail": thumbnail,
+        "vehicle_image": vehicle_image,
         "captured_at": captured, "image_url": None
     }
+
+
+def image_bytes(image, field, maximum_size):
+    if not isinstance(image, dict) or not image.get("Content"):
+        return None
+    try:
+        data = base64.b64decode(image["Content"], validate=True)
+    except (ValueError, TypeError):
+        raise ValueError(f"{field}.Content must be valid Base64")
+    if len(data) > maximum_size:
+        raise ValueError(f"{field} exceeds the {maximum_size // 1024} KiB limit")
+    if not data.startswith(b"\xff\xd8\xff"):
+        raise ValueError(f"{field} must be a JPEG image")
+    return data
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -81,8 +101,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"cameras": [dict(r) for r in rows]})
         if parsed.path == "/api/events":
             q = parse_qs(parsed.query); limit = min(int(q.get("limit", [50])[0]), 500)
-            conn = db(); rows = conn.execute("SELECT * FROM events ORDER BY captured_at DESC LIMIT ?", (limit,)).fetchall(); conn.close()
+            conn = db(); rows = conn.execute("SELECT id,plate,confidence,camera,direction,vehicle_type,vehicle_color,captured_at,image_url,created_at,thumbnail IS NOT NULL AS has_thumbnail,vehicle_image IS NOT NULL AS has_vehicle_image FROM events ORDER BY captured_at DESC LIMIT ?", (limit,)).fetchall(); conn.close()
             return self._send(200, {"events": [dict(r) for r in rows]})
+        if parsed.path.startswith("/api/events/"):
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) == 4 and parts[3] in ("thumbnail", "vehicle"):
+                try:
+                    event_id = int(parts[2]); column = "thumbnail" if parts[3] == "thumbnail" else "vehicle_image"
+                    conn = db(); row = conn.execute(f"SELECT {column} FROM events WHERE id=?", (event_id,)).fetchone(); conn.close()
+                    if not row or not row[column]: return self._send(404, {"error": "Image not found"})
+                    return self._send(200, row[column], "image/jpeg")
+                except ValueError: return self._send(400, {"error": "Invalid event id"})
         if parsed.path == "/api/analytics":
             conn = db(); total = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
             today = datetime.now(timezone.utc).date().isoformat(); today_count = conn.execute("SELECT COUNT(*) c FROM events WHERE substr(captured_at,1,10)=?", (today,)).fetchone()["c"]
@@ -92,7 +121,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path in ("/", "/index.html"):
             return self._send(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
         if parsed.path == "/app.js": return self._send(200, (ROOT / "app.js").read_bytes(), "text/javascript")
-        if parsed.path == "/styles.css": return self._send(200, (ROOT / "styles.css").read_bytes() + (ROOT / "camera.css").read_bytes(), "text/css")
+        if parsed.path == "/styles.css": return self._send(200, (ROOT / "styles.css").read_bytes() + (ROOT / "camera.css").read_bytes() + (ROOT / "image.css").read_bytes(), "text/css")
         self._send(404, {"error": "Not found"})
 
     def do_POST(self):
@@ -109,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0)); payload = json.loads(self.rfile.read(length)); event = normalise(payload)
             stored_payload = {key: event[key] for key in ("plate", "confidence", "direction", "vehicle_color", "captured_at")}
-            conn = db(); now = datetime.now(timezone.utc).isoformat(); cur = conn.execute("INSERT INTO events (plate,confidence,camera,direction,vehicle_type,vehicle_color,captured_at,image_url,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (*event.values(), json.dumps(stored_payload), now)); conn.commit(); event["id"] = cur.lastrowid; conn.close(); self._send(201, {"event": event})
+            conn = db(); now = datetime.now(timezone.utc).isoformat(); cur = conn.execute("INSERT INTO events (plate,confidence,camera,direction,vehicle_type,vehicle_color,thumbnail,vehicle_image,captured_at,image_url,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (*event.values(), json.dumps(stored_payload), now)); conn.commit(); event["id"] = cur.lastrowid; event["has_thumbnail"] = bool(event.pop("thumbnail")); event["has_vehicle_image"] = bool(event.pop("vehicle_image")); conn.close(); self._send(201, {"event": event})
         except (ValueError, json.JSONDecodeError) as e: self._send(400, {"error": str(e)})
         except Exception as e: self._send(500, {"error": "Internal server error", "detail": str(e)})
 
