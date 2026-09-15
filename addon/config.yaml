@@ -1,5 +1,5 @@
 name: Platewatch ANPR
-version: "1.0.12"
+version: "1.0.13"
 slug: platewatch
 description: ANPR camera event storage and analytics dashboard
 url: https://github.com/synthtex/platewatch-anpr
