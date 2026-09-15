@@ -27,6 +27,9 @@ def db():
         location TEXT, endpoint TEXT, enabled INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL
     )""")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+    if "vehicle_color" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN vehicle_color TEXT")
     return conn
 
 
@@ -37,27 +40,29 @@ def normalise(payload):
     plate_info = picture.get("Plate") if isinstance(picture.get("Plate"), dict) else {}
     snap_info = picture.get("SnapInfo") if isinstance(picture.get("SnapInfo"), dict) else {}
     vehicle_info = picture.get("Vehicle") if isinstance(picture.get("Vehicle"), dict) else {}
-    plate = payload.get("plate") or payload.get("license_plate") or payload.get("number_plate") or plate_info.get("PlateNumber")
+    plate = plate_info.get("PlateNumber")
     if not plate or not isinstance(plate, str):
         raise ValueError("plate is required")
-    confidence = payload.get("confidence", plate_info.get("Confidence"))
+    confidence = plate_info.get("Confidence")
     if confidence is not None:
         try:
             confidence = float(confidence)
-            if not 0 <= confidence <= 1: raise ValueError
+            if not 0 <= confidence <= 100: raise ValueError
+            confidence /= 100
         except (TypeError, ValueError):
-            raise ValueError("confidence must be between 0 and 1")
-    captured = payload.get("captured_at") or payload.get("timestamp") or snap_info.get("AccurateTime") or snap_info.get("SnapTime")
+            raise ValueError("Picture.Plate.Confidence must be between 0 and 100")
+    captured = snap_info.get("AccurateTime")
     if captured:
         try: datetime.fromisoformat(str(captured).replace("Z", "+00:00"))
         except ValueError: raise ValueError("captured_at must be ISO-8601")
     else: captured = datetime.now(timezone.utc).isoformat()
     return {
         "plate": plate.strip().upper(), "confidence": confidence,
-        "camera": str(payload.get("camera") or payload.get("camera_id") or snap_info.get("DeviceID") or "Unknown camera"),
-        "direction": str(payload.get("direction") or snap_info.get("Direction") or "Unknown"),
-        "vehicle_type": str(payload.get("vehicle_type") or payload.get("vehicle") or plate_info.get("PlateType") or vehicle_info.get("VehicleSeries") or "Unknown"),
-        "captured_at": captured, "image_url": payload.get("image_url") or payload.get("snapshot_url")
+        "camera": "Camera feed",
+        "direction": str(snap_info.get("Direction") or "Unknown"),
+        "vehicle_type": "Unknown",
+        "vehicle_color": str(vehicle_info.get("VehicleColor") or "Unknown"),
+        "captured_at": captured, "image_url": None
     }
 
 
@@ -103,7 +108,8 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/api/events": return self._send(404, {"error": "Not found"})
         try:
             length = int(self.headers.get("Content-Length", 0)); payload = json.loads(self.rfile.read(length)); event = normalise(payload)
-            conn = db(); now = datetime.now(timezone.utc).isoformat(); cur = conn.execute("INSERT INTO events (plate,confidence,camera,direction,vehicle_type,captured_at,image_url,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (*event.values(), json.dumps(payload), now)); conn.commit(); event["id"] = cur.lastrowid; conn.close(); self._send(201, {"event": event})
+            stored_payload = {key: event[key] for key in ("plate", "confidence", "direction", "vehicle_color", "captured_at")}
+            conn = db(); now = datetime.now(timezone.utc).isoformat(); cur = conn.execute("INSERT INTO events (plate,confidence,camera,direction,vehicle_type,vehicle_color,captured_at,image_url,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (*event.values(), json.dumps(stored_payload), now)); conn.commit(); event["id"] = cur.lastrowid; conn.close(); self._send(201, {"event": event})
         except (ValueError, json.JSONDecodeError) as e: self._send(400, {"error": str(e)})
         except Exception as e: self._send(500, {"error": "Internal server error", "detail": str(e)})
 
