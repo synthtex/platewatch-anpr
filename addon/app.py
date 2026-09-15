@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -28,11 +28,27 @@ def db():
         location TEXT, endpoint TEXT, enabled INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL
+    )""")
+    conn.execute("INSERT OR IGNORE INTO settings (key,value) VALUES ('retention_days','30')")
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
     for name, definition in (("vehicle_color", "TEXT"), ("thumbnail", "BLOB"), ("vehicle_image", "BLOB")):
         if name not in columns:
             conn.execute(f"ALTER TABLE events ADD COLUMN {name} {definition}")
+    conn.commit()
     return conn
+
+
+def retention_days(conn):
+    value = conn.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()["value"]
+    return int(value)
+
+
+def purge_expired_events(conn):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days(conn))).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("DELETE FROM events WHERE datetime(captured_at) < datetime(?)", (cutoff,))
+    conn.commit()
 
 
 def normalise(payload):
@@ -96,12 +112,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health": return self._send(200, {"status": "ok"})
+        if parsed.path == "/api/settings":
+            conn = db(); days = retention_days(conn); conn.close()
+            return self._send(200, {"retention_days": days})
         if parsed.path == "/api/cameras":
             conn = db(); rows = conn.execute("SELECT * FROM cameras ORDER BY name").fetchall(); conn.close()
             return self._send(200, {"cameras": [dict(r) for r in rows]})
         if parsed.path == "/api/events":
-            q = parse_qs(parsed.query); limit = min(int(q.get("limit", [50])[0]), 500)
-            conn = db(); rows = conn.execute("SELECT id,plate,confidence,camera,direction,vehicle_type,vehicle_color,captured_at,image_url,created_at,thumbnail IS NOT NULL AS has_thumbnail,vehicle_image IS NOT NULL AS has_vehicle_image FROM events ORDER BY captured_at DESC LIMIT ?", (limit,)).fetchall(); conn.close()
+            q = parse_qs(parsed.query)
+            try: limit = min(max(int(q.get("limit", [50])[0]), 1), 500)
+            except ValueError: return self._send(400, {"error": "limit must be between 1 and 500"})
+            plate_query = q.get("plate", [""])[0].strip().upper()
+            if len(plate_query) > 64: return self._send(400, {"error": "plate search is too long"})
+            sql = "SELECT id,plate,confidence,camera,direction,vehicle_type,vehicle_color,captured_at,image_url,created_at,thumbnail IS NOT NULL AS has_thumbnail,vehicle_image IS NOT NULL AS has_vehicle_image FROM events"
+            parameters = []
+            if plate_query:
+                sql += " WHERE plate LIKE ?"; parameters.append(f"%{plate_query}%")
+            sql += " ORDER BY captured_at DESC LIMIT ?"; parameters.append(limit)
+            conn = db(); purge_expired_events(conn); rows = conn.execute(sql, parameters).fetchall(); conn.close()
             return self._send(200, {"events": [dict(r) for r in rows]})
         if parsed.path.startswith("/api/events/"):
             parts = parsed.path.strip("/").split("/")
@@ -113,7 +141,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, row[column], "image/jpeg")
                 except ValueError: return self._send(400, {"error": "Invalid event id"})
         if parsed.path == "/api/analytics":
-            conn = db(); total = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+            conn = db(); purge_expired_events(conn); total = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
             today = datetime.now(timezone.utc).date().isoformat(); today_count = conn.execute("SELECT COUNT(*) c FROM events WHERE substr(captured_at,1,10)=?", (today,)).fetchone()["c"]
             unique = conn.execute("SELECT COUNT(DISTINCT plate) c FROM events").fetchone()["c"]; avg = conn.execute("SELECT AVG(confidence) v FROM events WHERE confidence IS NOT NULL").fetchone()["v"]
             hours = conn.execute("SELECT substr(captured_at,12,2) hour, COUNT(*) count FROM events GROUP BY hour ORDER BY hour").fetchall(); top = conn.execute("SELECT plate, COUNT(*) count FROM events GROUP BY plate ORDER BY count DESC LIMIT 5").fetchall(); conn.close()
@@ -138,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0)); payload = json.loads(self.rfile.read(length)); event = normalise(payload)
             stored_payload = {key: event[key] for key in ("plate", "confidence", "direction", "vehicle_color", "captured_at")}
-            conn = db(); now = datetime.now(timezone.utc).isoformat(); cur = conn.execute("INSERT INTO events (plate,confidence,camera,direction,vehicle_type,vehicle_color,thumbnail,vehicle_image,captured_at,image_url,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (*event.values(), json.dumps(stored_payload), now)); conn.commit(); event["id"] = cur.lastrowid; event["has_thumbnail"] = bool(event.pop("thumbnail")); event["has_vehicle_image"] = bool(event.pop("vehicle_image")); conn.close(); self._send(201, {"event": event})
+            conn = db(); purge_expired_events(conn); now = datetime.now(timezone.utc).isoformat(); cur = conn.execute("INSERT INTO events (plate,confidence,camera,direction,vehicle_type,vehicle_color,thumbnail,vehicle_image,captured_at,image_url,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (*event.values(), json.dumps(stored_payload), now)); conn.commit(); event["id"] = cur.lastrowid; event["has_thumbnail"] = bool(event.pop("thumbnail")); event["has_vehicle_image"] = bool(event.pop("vehicle_image")); conn.close(); self._send(201, {"event": event})
         except (ValueError, json.JSONDecodeError) as e: self._send(400, {"error": str(e)})
         except Exception as e: self._send(500, {"error": "Internal server error", "detail": str(e)})
 
@@ -150,6 +178,15 @@ class Handler(BaseHTTPRequestHandler):
             if not cur.rowcount: return self._send(404, {"error": "Camera not found"})
             self._send(200, {"deleted": camera_id})
         except ValueError: self._send(400, {"error": "Invalid camera id"})
+
+    def do_PUT(self):
+        if urlparse(self.path).path != "/api/settings": return self._send(404, {"error": "Not found"})
+        try:
+            length = int(self.headers.get("Content-Length", 0)); payload = json.loads(self.rfile.read(length)); days = int(payload.get("retention_days"))
+            if not 1 <= days <= 3650: raise ValueError("retention_days must be between 1 and 3650")
+            conn = db(); conn.execute("UPDATE settings SET value=? WHERE key='retention_days'", (str(days),)); conn.commit(); purge_expired_events(conn); conn.close()
+            self._send(200, {"retention_days": days})
+        except (ValueError, TypeError, json.JSONDecodeError) as e: self._send(400, {"error": str(e)})
 
     def log_message(self, *_): pass
 
